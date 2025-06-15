@@ -23,14 +23,14 @@ You must follow these instructions precisely, using the Markdown provided in the
 
 Re-organize the entire content into the following structure. Do not deviate from this format.
 
-*   **2.1. Summary:** Begin the entire document with a concise summary section, formatted as a `> blockquote`. This summary should briefly outline the key concepts covered in the document.
+*   **2.1. Summary:** Begin the entire document with a # started title and a concise summary section, formatted as a `> blockquote`. This summary should briefly outline the key concepts covered in the document.
 *   **2.2. Knowledge Section:**
     *   This is the main section and must come first after the summary.
     *   Present all the conceptual information here. Start with the core topics from the user's input, then introduce the expanded and related topics you added.
     *   Use clear headings (`##`) and subheadings (`###`) to organize the knowledge logically.
     *   Where appropriate, use LaTeX within Markdown (`$$...$$` for display math, `$...$` for inline math) to present mathematical formulas, equations, and definitions crisply. For example, define the cross-entropy loss function or the formula for an attention score. I want you to provide as rich proof as possible whereever you can and as detail as possible.
 *   **2.3. Interview Questions Section:**
-    *   After the complete knowledge section, create a dedicated `## Interview Questions` section.
+    *   After the complete knowledge section, create a dedicated `## Interview Questions` section containing more than 10 questions from simple to complex.
     *   Divide this into two required subsections: `### Theoretical Questions` and `### Practical & Coding Questions`.
     *   **a. Theoretical Questions:**
         *   Formulate questions that test deep conceptual understanding.
