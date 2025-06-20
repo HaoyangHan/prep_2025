@@ -1,221 +1,213 @@
-# A Deep Dive into Mixture of Experts (MoE) for Large Language Models
+# A Deep Dive into Mixture-of-Experts (MoE) for Large-Scale Models
 
-> This guide provides a comprehensive overview of the Mixture of Experts (MoE) architecture, a key technique for scaling neural networks to hundreds of billions or even trillions of parameters. We will deconstruct the seminal paper "Outrageously Large Neural Networks," explore the core concepts of conditional computation, sparse gating, and load balancing, and connect them to modern implementations in state-of-the-art models like Mixtral. The guide concludes with a curated set of theoretical and practical interview questions, complete with detailed answers and Python/PyTorch code implementations, to prepare you for rigorous technical interviews.
+> This guide provides a comprehensive overview of the Mixture-of-Experts (MoE) architecture, a key technique for scaling neural networks to trillions of parameters while maintaining computational efficiency. We will delve into the foundational concepts from the paper "Outrageously Large Neural Networks," explore the core mechanics of MoE layers, including the gating network and expert design, and discuss the critical challenge of load balancing. Furthermore, we will connect these foundational ideas to modern Large Language Models (LLMs) like Mixtral and Switch Transformers, and conclude with a set of theoretical and practical interview questions to solidify your understanding.
 
 ## Knowledge Section
 
-### 1. Introduction: The Scaling Challenge and Conditional Computation
+### 1. The Motivation: Conditional Computation
 
-The success of deep learning has been fueled by scaling: more data and larger models consistently yield better performance. However, traditional dense models face a critical bottleneck. In a dense architecture, every parameter is activated for every single input token. This means that as the model size (number of parameters) and training data grow, the computational cost increases quadratically, quickly becoming infeasible.
+The success of deep learning has been heavily reliant on scaling both the volume of training data and the size of the models. For traditional dense neural networks, every input requires computation across the entire set of model parameters. This leads to a computational cost that grows quadratically as both the model size and the number of training examples increase, quickly becoming unsustainable even with modern hardware.
 
-**Conditional Computation** offers a powerful solution. Instead of activating the entire network for every input, conditional computation selectively activates only certain parts of the model. This allows for a massive increase in the model's total number of parameters (its "capacity" to store knowledge) without a proportional increase in the computational cost (FLOPs) required for processing each input. The Sparsely-Gated Mixture of Experts layer is a highly successful implementation of this principle.
+**Conditional Computation** offers a powerful alternative. Instead of activating the entire network for every sample, conditional computation techniques activate only a subset of the network. This decision is made on a per-example basis, allowing the model to have a massive number of parameters (high capacity) while keeping the actual computational cost (FLOPs) for any given input low.
 
-### 2. The Sparsely-Gated Mixture of Experts (MoE) Layer
+The Mixture-of-Experts (MoE) model is one of the most successful implementations of conditional computation.
 
-An MoE layer replaces a standard component of a neural network (like a feed-forward block) with a more sophisticated structure. Imagine having a team of specialized "expert" networks. For any given input, instead of consulting every expert, you have a "gating network" or "router" that intelligently selects a small, relevant subset of experts to process the input. The final output is then a weighted combination of the outputs from these selected experts.
+### 2. The Sparsely-Gated Mixture-of-Experts (MoE) Layer
 
-The MoE layer, as proposed in the 2017 paper, consists of two main components:
+The core idea of MoE is to replace a single, large feed-forward network with numerous smaller "expert" networks and a "gating network" that learns to choose which experts to consult for each input.
 
-1.  **Expert Networks ($E_i$):** A set of $n$ simpler neural networks, typically feed-forward networks (FFNs). In the original paper, they were placed between LSTM layers, but in modern Transformers, they replace the FFN block. Each expert has its own distinct set of parameters.
-2.  **Gating Network ($G$):** A trainable routing network that determines which experts to activate for a given input. It takes the input token's representation and outputs a probability distribution over the experts.
+The paper "Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer" introduced a practical and scalable MoE layer, enabling models to grow to over 1000 times their original capacity with only minor losses in computational efficiency.
 
-#### 2.1. Mathematical Formulation
+#### 2.1 Core Architecture
 
-Given an input vector $x$, the output of an MoE layer, $y$, is a weighted sum of the expert outputs. The weights are provided by the gating network $G$.
+An MoE layer consists of two primary components:
+
+1.  **Expert Networks ($E_i$):** A set of $n$ simpler neural networks (typically feed-forward networks). In the context of the paper, each expert is an independent network, but they all share the same architecture.
+2.  **Gating Network ($G$):** A trainable network that determines which experts to activate for a given input. It produces a sparse n-dimensional vector of weights, where most weights are zero.
+
+For a given input vector $x$, the output of the MoE layer, $y$, is a weighted sum of the outputs from the expert networks. The weights are provided by the gating network.
 
 $$
 y = \sum_{i=1}^{n} G(x)_i \cdot E_i(x)
 $$
 
-Where:
-*   $n$ is the total number of experts.
-*   $E_i(x)$ is the output of the $i$-th expert network.
-*   $G(x)_i$ is the weight (gate value) assigned by the gating network to the $i$-th expert.
+The key to efficiency is the sparsity of $G(x)$. If $G(x)_i = 0$, the computation for the expert $E_i(x)$ can be skipped entirely. This means that even with thousands of experts, only a small handful (e.g., the top 2 or 4) are used for any single input token.
 
-Crucially, for this to be computationally efficient, the gating vector $G(x)$ must be **sparse**. This means most of its values, $G(x)_i$, are zero. If $G(x)_i = 0$, there is no need to compute the output of the corresponding expert $E_i(x)$, saving significant computation.
+![Figure 1: An MoE layer embedded within a recurrent language model. In this example, the sparse gating function selects two experts to perform the computation. The outputs of these experts are then combined based on the weights from the gating network.](image/image_p_tlx5W7De.png)
 
-#### 2.2. The Noisy Top-K Gating Mechanism
+#### 2.2 The Noisy Top-K Gating Mechanism
 
-A simple softmax gate would produce dense weights, requiring every expert to be computed. To enforce sparsity, the authors introduced **Noisy Top-K Gating**.
-
-The process is as follows:
-
-1.  **Compute pre-gate logits:** The input $x$ is passed through a linear layer to produce logits for each expert.
-    $$
-    h(x) = x \cdot W_g
-    $$
-2.  **Add tunable noise:** To improve load balancing and encourage exploration during training, a controllable amount of Gaussian noise is added to the logits.
-    $$
-    H(x)_i = h(x)_i + \text{StandardNormal}() \cdot \text{Softplus}((x \cdot W_{\text{noise}})_i)
-    $$
-    The `Softplus` function ensures the noise scale is always positive. This noise injection is a form of exploration, preventing the gating network from collapsing into a state where it only ever picks a few popular experts.
-3.  **Select Top-K Experts:** Only the logits with the top $k$ values are kept; the rest are set to $-\infty$. This is the hard sparsity-inducing step.
-    $$
-    \text{KeepTopK}(v, k)_i = \begin{cases} v_i & \text{if } v_i \text{ is in the top } k \text{ elements of } v \\ -\infty & \text{otherwise.} \end{cases}
-    $$
-4.  **Apply Softmax:** A standard softmax function is applied to the resulting sparse vector of logits. This converts the logits into a valid probability distribution over the selected $k$ experts. The experts whose logits were set to $-\infty$ will have a final gate value of 0.
-    $$
-    G(x) = \text{Softmax}(\text{KeepTopK}(H(x), k))
-    $$
-Typically, $k$ is a small number like 1, 2, or 4, even when the total number of experts $n$ is in the thousands. This ensures that only a tiny fraction of the model's parameters are used for any given token.
-
-### 3. Training Challenges and Solutions
-
-Implementing MoE layers introduces unique challenges not present in dense models.
-
-#### 3.1. The Load Balancing Problem
-
-A major issue is that the gating network is a feedback loop. It learns to send tokens to the experts that give the best results. This can lead to a "rich-get-richer" dynamic where a few experts are heavily favored and trained, while others are neglected and remain underdeveloped. This imbalance negates the benefit of having a large number of diverse experts.
-
-To counteract this, an **auxiliary loss function** is added to the main model loss. This loss encourages the gating network to distribute the load more evenly across all experts. The total loss becomes:
+A naive gating network could simply use a Softmax function over a linear transformation of the input.
 
 $$
-L = L_{\text{task}} + w_{\text{aux}} \cdot L_{\text{aux}}
+G_{\sigma}(x) = \text{Softmax}(x \cdot W_g)
 $$
 
-The auxiliary loss, $L_{\text{aux}}$, is designed to equalize the importance of each expert over a training batch. The "importance" of an expert is the sum of the gate values it receives across all tokens in a batch.
+However, this produces dense outputs, requiring every expert to be computed. The paper proposes a **Sparsely-Gated** mechanism that introduces both **sparsity** and **noise**:
 
-Let $B$ be the set of tokens in a training batch. The importance of expert $i$ is:
+1.  **Add Tunable Gaussian Noise:** Before selecting the top experts, noise is added to the gating network's logits. This encourages exploration and helps with load balancing, preventing the gating network from consistently picking the same few "favorite" experts.
+2.  **Select Top-K Experts:** Only the top `k` values from the noisy logits are kept. The rest are set to $-\infty$ so that they become zero after the Softmax operation. This enforces sparsity.
+
+The combined mechanism is defined as follows:
+
+Let $H(x)$ be the noisy logits for input $x$:
 $$
-\text{Importance}_i = \sum_{x \in B} G(x)_i
+H(x)_i = (x \cdot W_g)_i + \text{StandardNormal}() \cdot \text{Softplus}((x \cdot W_{\text{noise}})_i)
 $$
+Here, $W_g$ are the standard gating weights, and $W_{\text{noise}}$ is a trainable weight matrix that scales the amount of noise added for each expert.
 
-The auxiliary loss is then defined as the squared coefficient of variation (CV) of these importance values across all experts:
+The final gating output $G(x)$ is then:
 $$
-L_{\text{aux}} = \left( \text{CV}(\text{Importance}) \right)^2 = \left( \frac{\text{std}(\text{Importance})}{\text{mean}(\text{Importance})} \right)^2
+G(x) = \text{Softmax}(\text{KeepTopK}(H(x), k))
 $$
+where `KeepTopK(v, k)` retains the top `k` values of a vector `v` and sets all others to $-\infty$.
 
-Minimizing this loss pushes the standard deviation of expert importance towards zero, meaning all experts receive a similar amount of training signal over a batch. $w_{\text{aux}}$ is a tunable hyperparameter that balances the primary task loss with this load balancing objective.
+Even though this hard selection introduces theoretical discontinuities, the authors found it works well in practice and is crucial for computational savings.
 
-#### 3.2. The Shrinking Batch Problem
+#### 2.3 Hierarchical MoE
 
-Conditional computation leads to a practical implementation challenge. Imagine a batch of 512 tokens, a total of 64 experts ($n=64$), and we select the top 2 experts for each token ($k=2$). Each expert will, on average, only receive $\frac{512 \times 2}{64} = 16$ tokens. This drastically reduced, or "shrunken," batch size per expert is inefficient for modern hardware like GPUs, which are optimized for large, parallel matrix multiplications.
+When the number of experts becomes extremely large, a single gating network can become a bottleneck. A **Hierarchical MoE** can be used to manage this complexity. In this setup, a primary gating network selects a group of secondary MoEs, and each of those secondary MoEs then selects the final expert networks.
 
-The solution involves a combination of data and model parallelism:
-*   **Model Parallelism:** The experts themselves are distributed across multiple devices (e.g., GPUs). For instance, if you have 8 GPUs, each GPU can hold 8 out of the 64 experts.
-*   **Data Parallelism:** The input data batch is present on every device. Each device processes the full batch of tokens through its local experts. All-to-all communication is then required to send each token's representation to the device holding its assigned expert and to gather the results. This approach ensures that each expert still processes a large number of tokens aggregated from the batches on all devices, thus solving the shrinking batch problem.
+![Figure 2: Structure of a Hierarchical MoE. A primary gate selects groups of experts, and secondary gates within each group make the final selection.](image/image_udZNHrE3rb.png)
 
-### 4. MoE in Modern LLMs (e.g., Mixtral 8x7B)
+The output for a two-level Hierarchical MoE is given by:
+$$
+y_{H} = \sum_{i=1}^{a} \sum_{j=1}^{b} G_{\text{primary}}(x)_i \cdot G_{i}(x)_j \cdot E_{i,j}(x)
+$$
+where there are $a$ groups, each with $b$ experts.
 
-While the original paper applied MoE to LSTMs, its most impactful application today is within the **Transformer architecture**. In a standard Transformer block, the MoE layer replaces the feed-forward network (FFN) sub-layer.
+### 3. The Challenge of Load Balancing
 
-**Mixtral 8x7B: A Case Study (as of late 2023)**
+A major challenge in training MoE models is that the gating network often converges to a state of **imbalance**. It learns to favor a small subset of popular experts, while the rest receive little to no training and remain underdeveloped. This creates a self-reinforcing cycle: the popular experts get better because they are trained more, which in turn makes them more likely to be selected by the gate.
 
-Mistral AI's Mixtral 8x7B is a prominent example of a high-performing open-source MoE model. Its architecture highlights modern MoE design:
-*   **Total vs. Active Parameters:** The model has 8 experts. The "8x7B" naming suggests that each expert is around 7 billion parameters. However, many parameters (like the attention layers) are shared across experts. The total parameter count is closer to 47B, not 56B.
-*   **Sparse Activation:** For each token at each MoE layer, the router selects the **top 2** experts. This means that during inference, only about 13B parameters are active per token (the shared parameters plus the parameters of two 7B-class experts). This is why it has the speed and cost of a 13B dense model but the knowledge capacity of a much larger 47B model.
-*   **Placement:** The MoE layers are used in place of the FFN layers in the Transformer blocks. This is done for every other layer in the model's architecture.
+To counteract this, the paper introduces an **auxiliary loss function** to encourage a more balanced distribution of inputs across all experts. This loss is added to the main model loss during training. The goal is to ensure that all experts receive a roughly equal amount of computation/importance over a training batch.
 
-The structure of a Transformer block with an MoE layer looks like this:
+The auxiliary loss consists of two parts:
 
-1.  Input `x`
-2.  `x = x + MultiHeadSelfAttention(LayerNorm(x))`
-3.  `x = x + MoELayer(LayerNorm(x))`  *(Replaces the FFN)*
-4.  Output `x`
+1.  **Importance Loss ($L_{\text{importance}}$):** This loss encourages each expert to have roughly the same total "importance" or gating weight summed over a batch of training examples. The importance of an expert is the sum of its gate values across all examples in a batch $X$.
+    $$
+    \text{Importance}(X)_i = \sum_{x \in X} G(x)_i
+    $$
+    The loss is then the squared coefficient of variation (CV) of these importance values, scaled by a hyperparameter $w_{\text{importance}}$.
+    $$
+    L_{\text{importance}} = w_{\text{importance}} \cdot \text{CV}(\text{Importance}(X))^2
+    $$
+    This penalizes situations where some experts have a much higher total gating weight than others.
 
-### 5. Pros and Cons of Mixture of Experts
+2.  **Load Loss ($L_{\text{load}}$):** This loss (detailed in the paper's appendix) directly considers the number of examples dispatched to each expert, ensuring a more balanced "load" in terms of data points.
+
+By adding this auxiliary loss, the model is penalized for relying too heavily on a few experts, forcing the gating network to spread the load more evenly and ensuring all experts are effectively trained.
+
+### 4. MoE in Modern LLMs: From LSTMs to Transformers
+
+The original paper implemented MoE layers between stacked LSTM layers for language modeling and machine translation. However, the architecture is highly versatile. In modern LLMs, MoE layers are most commonly used to replace the feed-forward network (FFN) sub-layer within a Transformer block.
+
+-   A standard Transformer block has a Multi-Head Self-Attention layer followed by a dense FFN.
+-   An MoE Transformer block replaces this dense FFN with an MoE layer.
+
+This allows for a dramatic increase in the parameter count of the FFN component (where a significant portion of model parameters reside) without a corresponding increase in the FLOPs required for a forward pass.
+
+**Notable Modern MoE Architectures (as of early 2024):**
+
+*   **Google's Switch Transformer (2021):** Pushed the MoE concept to its limits, creating models with over a trillion parameters. They simplified the routing by only sending each token to a single expert (Top-1 gating), which proved to be highly effective and computationally efficient, though it required addressing training instabilities.
+*   **Mistral AI's Mixtral 8x7B (2023):** A high-performing, open-source sparse MoE model. It uses 8 experts per MoE layer and routes each token to the top 2 experts. This means that for any given token, only 2 out of the 8 experts are active. While it is marketed as a "47B" parameter model (8 experts * ~6B params + attention params), its inference cost is closer to that of a 12B dense model because only a fraction of the parameters are used per token.
+
+### 5. Key Experimental Results from the Paper
+
+The paper demonstrated the effectiveness of their Sparsely-Gated MoE layer on large-scale language modeling and machine translation tasks.
+
+*   **Language Modeling:**
+    *   On the 1-Billion Word Benchmark, a 4096-expert MoE model achieved a 24% reduction in perplexity compared to a computationally matched dense LSTM baseline.
+    *   MoE models consistently achieved lower perplexity than dense models with a similar computational budget (TFLOPS).
+
+    ![Figure 3: Left - Perplexity vs. number of experts. Right - Perplexity vs. computation. The MoE models significantly outperform the dense baselines.](image/image_VVSwgu-e_M.png)
+
+    *   The largest models demonstrated high computational efficiency on GPUs, indicating the engineering solutions to the "shrinking batch problem" were successful.
+
+    ![Figure 4: Computational efficiency (TFLOPS/GPU) for various model sizes.](image/image_I0Th7l69St.png)
+
+    *   On a massive 100-Billion word Google News corpus, a model with 65,536 experts (68 billion parameters) achieved a 39% lower perplexity than its dense counterpart.
+
+    ![Figure 5: Perplexity improvement on a 100-Billion word dataset as the number of experts increases.](image/image_z1BDUvARQu.png)
+
+*   **Machine Translation:**
+    *   By integrating MoE layers into Google's Neural Machine Translation (GNMT) model, they achieved state-of-the-art BLEU scores on WMT'14 English-to-French and English-to-German benchmarks.
+
+    ![Figure 6: BLEU scores on WMT'14 English-to-French translation.](image/image_YgHtgi4GYy.png)
+
+    ![Figure 7: BLEU scores on WMT'14 English-to-German translation.](image/image_0Q2avdKexQ.png)
+
+    *   The MoE model also showed faster convergence, achieving a higher BLEU score in one-sixth of the training time compared to the dense baseline on an internal Google dataset.
+
+    ![Figure 8: BLEU score vs. training time on a large production dataset.](image/image_9vVrb4vP--.png)
+
+    ![Figure 9: Summary table of translation results.](image/image_kO6_ltd0be.png)
+
+### 6. Advantages and Disadvantages of MoE
 
 #### Advantages
-*   **Scalable Capacity:** Allows for a massive increase in the number of model parameters without a proportional increase in inference cost.
-*   **Fast Inference:** For a given parameter count, MoE models are significantly faster at inference than dense models because they only use a fraction of their parameters per token.
-*   **Specialization:** Experts can learn to specialize in different aspects of the data (e.g., different languages, topics, or syntactic structures), potentially leading to better performance.
+1.  **High Parameter Count, Low Computational Cost:** MoE models can have trillions of parameters but only use a fraction of them for any given input, making them computationally feasible to train and serve.
+2.  **Increased Model Capacity:** The vast number of parameters allows the model to absorb more knowledge from the training data, leading to better performance on complex tasks.
+3.  **Expert Specialization:** The experts can learn to specialize in different aspects of the data (e.g., different languages, topics, or syntactic structures), leading to more nuanced representations.
 
 #### Disadvantages
-*   **High VRAM Requirement:** During training and inference, all parameters (all experts) must be loaded into memory (VRAM), even though only a fraction are used at a time. A model like Mixtral 8x7B requires significant VRAM to load all ~47B parameters.
-*   **Training Instability:** Training MoE models can be more challenging. The auxiliary loss is critical, and tuning its weight ($w_{\text{aux}}$) can be difficult. Poor tuning can lead to load balancing issues or convergence problems.
-*   **Implementation Complexity:** The routing logic, communication overhead (all-to-all), and parallel strategies make MoE models more complex to implement and optimize than dense models.
-
----
+1.  **Training Instability:** MoE models can be harder to train than dense models due to issues like load imbalance. The auxiliary loss is crucial but requires careful tuning.
+2.  **High Memory Requirements:** Although computationally efficient at inference time, all expert parameters must be loaded into memory (VRAM), making the hardware requirements substantial.
+3.  **Implementation Complexity:** The routing logic, auxiliary loss, and communication overhead (in distributed settings) make MoE models more complex to implement and optimize.
+4.  **Communication Overhead:** In distributed training, the gating mechanism requires communication between devices to route tokens to the correct experts, which can become a bottleneck.
 
 ## Interview Questions
 
 ### Theoretical Questions
 
-#### Question 1: What is Mixture of Experts (MoE) and how does it fundamentally differ from a standard dense model?
-**Answer:**
-A Mixture of Experts (MoE) is a neural network architecture based on the principle of **conditional computation**. It consists of a set of "expert" sub-networks and a "gating network" or "router." For each input, the gating network selects a small subset of experts to process it, and their outputs are combined to produce the final result.
+**1. What is a Mixture-of-Experts (MoE) layer and what fundamental problem does it solve?**
 
-The fundamental difference from a dense model lies in parameter activation:
-*   **Dense Model:** For every input token, **all** parameters of the model are activated and used in the computation. The computational cost (FLOPs) is directly proportional to the total number of parameters.
-*   **MoE Model:** For every input token, only a **small fraction** of the parameters are activated—specifically, the parameters of the shared components (like attention layers) and the few experts selected by the gating network. This decouples the total parameter count from the computational cost per token, allowing for models with extremely high parameter counts (knowledge capacity) but relatively low inference cost.
+*   **Answer:** A Mixture-of-Experts (MoE) layer is a neural network component that implements conditional computation. Instead of a single, large, dense network, it uses a collection of smaller "expert" networks and a "gating network." For each input, the gating network dynamically selects a small subset of these experts to process the input.
+*   The fundamental problem it solves is **scaling model capacity without proportionally scaling computational cost**. Traditional dense models require computations across all parameters for every input. MoE decouples the number of parameters from the computation per input, allowing for models with trillions of parameters while keeping the floating-point operations (FLOPs) for a forward pass manageable.
 
-In essence, dense models use all their knowledge for every problem, while MoE models learn to consult only the most relevant specialists for each specific problem.
+**2. Explain the two main components of an MoE layer: the experts and the gating network.**
 
-#### Question 2: Explain the "load balancing" problem in MoE and derive the auxiliary loss function used to address it.
-**Answer:**
-The load balancing problem arises because the gating network, which is trained alongside the experts, can develop a bias towards a few "favorite" experts. This creates a self-reinforcing loop: certain experts receive more training data, become better, and are thus chosen even more frequently by the gate. Other experts are starved of data, remain undertrained, and are rarely selected. This imbalance undermines the very purpose of having a large, diverse set of experts.
+*   **Answer:**
+    *   **Experts:** These are the "workers" of the MoE layer. Each expert is typically a simple neural network, most commonly a feed-forward network (FFN). All experts have the same architecture but are initialized with and learn different weights. They are designed to specialize in different types of data or sub-tasks.
+    *   **Gating Network:** This is the "router" or "manager." It's a small neural network that takes the input token's representation and outputs a probability distribution over all the experts. In a sparsely-gated MoE, this output is sparse, meaning it assigns high probability (and thus sends the input) to only a few experts (e.g., the top 2). Its job is to learn the best expert(s) to handle any given input.
 
-To solve this, an **auxiliary loss function** is added to the main task loss during training. This loss encourages the gating network to distribute tokens (the "load") evenly across all experts.
+**3. Why is load balancing a critical issue in MoE models? How is it typically addressed?**
 
-**Derivation and Explanation:**
-The goal is to ensure that over a batch of data, each expert receives a roughly equal amount of attention from the gating network.
+*   **Answer:** Load balancing is critical because the gating network has a natural tendency to converge towards a state of imbalance. It often learns to favor a small number of "popular" experts for most inputs. This creates a destructive feedback loop: popular experts receive more training updates and become better, making them even more likely to be chosen, while other experts are starved of data and never learn useful representations. This undermines the entire principle of having a large, diverse set of specialists.
+*   This issue is typically addressed by adding an **auxiliary loss function** to the main model loss. This loss penalizes imbalance. A common formulation, as seen in the "Outrageously Large Neural Networks" paper, is a loss based on the **coefficient of variation** of the total gating weights assigned to each expert over a batch. Let $G(x)_i$ be the gate value for expert $i$ and input $x$. The total importance for expert $i$ over a batch $X$ is $\text{Importance}_i = \sum_{x \in X} G(x)_i$. The auxiliary loss is $L_{\text{aux}} = w \cdot \text{CV}(\text{Importance})^2$. This loss encourages the gating network to distribute the inputs more evenly across all experts, ensuring they all receive sufficient training.
 
-1.  **Define Expert Importance:** First, we define the "importance" of an expert $i$ over a batch of tokens $B$ as the sum of the gate values it receives for all tokens in that batch.
-    $$
-    \text{Importance}_i(B) = \sum_{x \in B} G(x)_i
-    $$
-    Here, $G(x)_i$ is the gate's output weight for expert $i$ on input $x$.
+**4. Explain the "Sparsely-Gated" mechanism from the paper "Outrageously Large Neural Networks". Why are both noise and a Top-K selection used?**
 
-2.  **Goal: Equal Importance:** If the load is perfectly balanced, the importance value for every expert would be the same. This means the variance (or standard deviation) of the set of importance values `[Importance_1, Importance_2, ..., Importance_n]` would be zero.
+*   **Answer:** The Sparsely-Gated mechanism is designed to produce a sparse gating vector efficiently. It involves two key steps before the final Softmax:
+    1.  **Top-K Selection:** The gating network produces a logit for each expert. Instead of using all of them, only the experts with the top `k` logit values are selected. The logits for all other experts are set to $-\infty$. This hard selection is the primary source of sparsity, ensuring that only `k` experts are computationally engaged for any input.
+    2.  **Addition of Tunable Noise:** Before the Top-K selection, tunable Gaussian noise is added to the logits. The formula is $H(x)_i = (x \cdot W_g)_i + \text{noise}$. This noise serves as a form of exploration and is crucial for load balancing. It prevents the model from getting stuck in a feedback loop where it always picks the same experts by making the selection process stochastic, especially early in training. This gives under-utilized experts a chance to be selected and trained.
 
-3.  **Formulate the Loss:** A common way to penalize variance is to use the **Coefficient of Variation (CV)**, which is the standard deviation divided by the mean. The auxiliary loss is typically defined as the square of the CV of the experts' importance values.
-    $$
-    L_{\text{aux}} = w_{\text{aux}} \cdot \left( \text{CV}(\text{Importance}) \right)^2 = w_{\text{aux}} \cdot \left( \frac{\sqrt{\text{Var}(\text{Importance})}}{\text{Mean}(\text{Importance})} \right)^2
-    $$
-    where $w_{\text{aux}}$ is a tunable hyperparameter. Adding this term to the main loss function penalizes the model whenever the distribution of work across experts becomes uneven, pushing the training dynamics toward a more balanced state.
+**5. How does an MoE model increase model capacity without a proportional increase in computational cost (FLOPs)?**
 
-#### Question 3: How is an MoE layer typically integrated into a modern Transformer architecture like GPT or Mixtral? Which component does it replace?
-**Answer:**
-In modern Transformer architectures, the MoE layer is used as a direct, drop-in replacement for the **Feed-Forward Network (FFN)** sub-layer within a Transformer block.
+*   **Answer:** The key is **conditional computation**. Let's compare a dense model with an MoE model.
+    *   **Dense Model:** If a feed-forward layer has $d_{model}$ input dimensions and $d_{ffn}$ hidden dimensions, the FLOPs are proportional to $2 \cdot d_{model} \cdot d_{ffn}$. All parameters are used for every token.
+    *   **MoE Model:** Suppose we have $N$ experts, each with a hidden dimension of $d_{ffn}$, and we select the top $k$ experts (where $k \ll N$).
+        *   **Model Capacity (Parameters):** The total number of parameters in the FFN layer is roughly $N \times (2 \cdot d_{model} \cdot d_{ffn})$. This can be huge if $N$ is large.
+        *   **Computational Cost (FLOPs):** For a single token, we first compute the gating logits (~$d_{model} \cdot N$). Then, we only perform the FFN computation for the selected $k$ experts. The FLOPs are therefore proportional to $k \times (2 \cdot d_{model} \cdot d_{ffn})$.
+    *   **Conclusion:** The model's parameter count scales with $N$, but its computational cost scales with $k$. Since we choose $k$ to be a small constant (e.g., 2 or 4) and can make $N$ very large (e.g., 8, 64, or more), we can dramatically increase capacity with only a small, constant increase in FLOPs.
 
-A standard Transformer block consists of two main sub-layers:
-1.  A Multi-Head Self-Attention (MHSA) layer.
-2.  A position-wise Feed-Forward Network (FFN), which is typically a two-layer MLP.
+**6. Compare and contrast a Transformer model with MoE layers (like Mixtral 8x7B) to a standard dense Transformer model (like Llama 2).**
 
-The data flow in a standard block is: `Attention -> Add & Norm -> FFN -> Add & Norm`.
-
-To integrate MoE, the FFN is replaced with the MoE layer. The MoE layer itself contains multiple FFNs (the experts) and a gating network to route to them. The data flow becomes:
-
-**Transformer Block with MoE:**
-1.  Input `x`
-2.  `attention_output = MultiHeadSelfAttention(LayerNorm(x))`
-3.  `x = x + attention_output`
-4.  `moe_output = MoELayer(LayerNorm(x))`  **(This is the replacement)**
-5.  `x = x + moe_output`
-6.  Output `x`
-
-So, the MoE layer takes the place of the dense FFN. This is a powerful strategic choice because the FFN component typically accounts for about two-thirds of a Transformer's parameters. Replacing it with a sparse MoE layer allows for a massive increase in parameters in that part of the model while keeping the per-token computation low. In models like Mixtral, this replacement is done in alternating layers to balance model capacity and training stability.
-
-#### Question 4: Explain the "shrinking batch problem" in MoE and discuss the technical solutions used to mitigate it.
-**Answer:**
-The "shrinking batch problem" is a critical performance issue in naive MoE implementations. Modern hardware like GPUs achieves high throughput by performing operations on large tensors (batches) in parallel. In an MoE model, the gating network splits the input batch of tokens among many experts.
-
-For example, if you have a batch of 1024 tokens, 128 experts, and you route each token to 2 experts ($k=2$), each expert, on average, will only process $\frac{1024 \times 2}{128} = 16$ tokens. This tiny "batch" per expert is extremely inefficient for a GPU, leading to severe under-utilization of the hardware and slow training times.
-
-**Solutions:**
-The primary solution involves a clever combination of **model parallelism** and **data parallelism**, often orchestrated with an **all-to-all communication** primitive.
-
-1.  **Model Parallelism:** The experts are distributed across multiple processing units (e.g., GPUs). If you have 8 GPUs and 128 experts, each GPU can hold $128 / 8 = 16$ experts. All parameters for these 16 experts reside on their assigned GPU.
-
-2.  **Data Parallelism:** The full batch of input tokens is replicated on *each* GPU.
-
-3.  **Computation and Communication Flow:**
-    *   **Step 1 (Gating):** Each GPU computes the gating decisions for the *entire* batch of 1024 tokens. Now, each GPU knows which two experts each token needs to be sent to.
-    *   **Step 2 (All-to-All Communication):** An `all-to-all` communication operation is performed. Each GPU partitions its batch of 1024 tokens into 8 chunks, one for each destination GPU. GPU `i` sends the chunk of tokens destined for experts on GPU `j` to GPU `j`. After this step, each GPU has a new batch of tokens, where all tokens in this new batch are designated for the experts residing locally on that GPU. This re-shuffled batch is now large enough for efficient computation.
-    *   **Step 3 (Expert Computation):** Each GPU processes its re-shuffled batch of tokens through its local experts.
-    *   **Step 4 (Reverse All-to-All):** A second `all-to-all` operation is performed to send the results from the experts back to the original GPUs, so that each token's representation is back on the GPU where it started.
-
-This sophisticated strategy ensures that each expert processes a large batch of tokens aggregated from all devices, solving the shrinking batch problem and allowing MoE models to train efficiently at scale.
-
----
+*   **Answer:**
+    *   **Similarity:** Both are Transformer-based architectures. They use the same self-attention mechanism. The overall block structure is similar (attention followed by a feed-forward-style layer).
+    *   **Difference (Core Architecture):** The key difference lies in the feed-forward network (FFN) layer within each Transformer block.
+        *   **Dense Model (Llama 2):** Uses a standard, dense FFN. Every input token is processed by the same FFN, activating all of its parameters.
+        *   **MoE Model (Mixtral 8x7B):** Replaces the dense FFN with a sparse MoE layer. In Mixtral's case, this layer contains 8 distinct FFNs (experts). For each token, a gating network selects the top 2 experts to process it.
+    *   **Contrast (Parameters vs. Computation):**
+        *   **Parameters:** Mixtral has a much larger total parameter count (~47B) than a dense model of similar inference cost (e.g., Llama 2 13B) because it stores 8 separate sets of expert weights.
+        *   **Computation:** During inference, Mixtral's computational cost is much lower than its total parameter count suggests. Since only 2 of the 8 experts are used per token, its FLOPs are comparable to a ~12B-13B dense model, not a 47B dense model.
+    *   **Effect:** This allows Mixtral to have the knowledge capacity of a much larger model while maintaining the inference speed of a smaller one, generally leading to stronger performance than dense models of a similar computational budget.
 
 ### Practical & Coding Questions
 
-#### Question 5: Implement a basic MoE layer from scratch in PyTorch. Your implementation should include a gating network and a list of experts, and show how an input batch is processed.
+**1. Implement a basic MoE layer from scratch in PyTorch.**
 
-**Answer:**
-
-Here is a complete, commented PyTorch implementation of a basic MoE layer.
+*   **Answer:** Here is a Python implementation of a basic MoE layer using PyTorch. It includes the Expert network, the Gating network, and the main MoE layer that combines them.
 
 ```python
 import torch
@@ -224,8 +216,8 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
-# A simple Feed-Forward Network to be used as an expert
 class Expert(nn.Module):
+    """A simple feed-forward network expert."""
     def __init__(self, d_model, d_hidden):
         super().__init__()
         self.net = nn.Sequential(
@@ -237,13 +229,12 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# The main MoE Layer
 class MoELayer(nn.Module):
     """
-    A basic Mixture of Experts layer.
+    A Sparsely-Gated Mixture-of-Experts layer.
 
     Args:
-        d_model (int): The hidden dimension of the input and output.
+        d_model (int): The input and output dimension of the model.
         num_experts (int): The total number of experts.
         top_k (int): The number of experts to route each token to.
         d_hidden (int): The hidden dimension of each expert's FFN.
@@ -253,107 +244,85 @@ class MoELayer(nn.Module):
         self.d_model = d_model
         self.num_experts = num_experts
         self.top_k = top_k
-
+        
         # Create a list of expert networks
         self.experts = nn.ModuleList([Expert(d_model, d_hidden) for _ in range(num_experts)])
-
-        # The gating network (router)
+        
+        # Gating network: a linear layer to produce logits for each expert
         self.gate = nn.Linear(d_model, num_experts)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_len, d_model)
+        """
+        Forward pass for the MoE layer.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_model)
+            
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, d_model)
+            torch.Tensor: Auxiliary load balancing loss.
+        """
         batch_size, seq_len, d_model = x.shape
+        # Reshape input for gating and expert processing
+        x = x.view(-1, d_model) # Shape: (batch_size * seq_len, d_model)
         
-        # Reshape for gating: (batch_size * seq_len, d_model)
-        x_reshaped = x.reshape(-1, d_model)
+        # 1. Gating Decision
+        # Get logits from the gating network
+        gate_logits = self.gate(x) # Shape: (batch_size * seq_len, num_experts)
         
-        # 1. Gating: Get logits for each expert
-        # gate_logits shape: (batch_size * seq_len, num_experts)
-        gate_logits = self.gate(x_reshaped)
-
-        # 2. Select Top-K experts
-        # Find the top-k scores and their indices
-        # top_k_weights and top_k_indices shape: (batch_size * seq_len, top_k)
-        top_k_weights, top_k_indices = torch.topk(gate_logits, self.top_k, dim=-1)
+        # Find the top_k experts for each token
+        # top_k_gates are the scores, top_k_indices are the expert indices
+        top_k_gates, top_k_indices = torch.topk(gate_logits, self.top_k, dim=-1, sorted=False) # Shape: (..., top_k)
         
-        # Apply softmax to the top-k scores to get routing weights
-        routing_weights = F.softmax(top_k_weights, dim=-1)
-
-        # 3. Route tokens to experts and aggregate results
-        # We need to create a final output tensor of the same shape as the input
-        final_output = torch.zeros_like(x_reshaped)
+        # Apply softmax to the top_k scores to get weights
+        gate_scores = F.softmax(top_k_gates, dim=-1) # Shape: (..., top_k)
         
-        # To make this efficient, we create a flat list of tokens and their expert assignments
-        # flat_top_k_indices shape: (batch_size * seq_len * top_k)
+        # 2. Load Balancing Loss Calculation
+        # This is a simplified version of the importance loss from the paper
+        # It encourages the gate to distribute tokens evenly among experts.
+        # `F.one_hot` creates a binary mask indicating which experts were chosen for each token
+        expert_mask = F.one_hot(top_k_indices, self.num_experts).sum(dim=1) # Shape: (..., num_experts)
+        # Calculate the fraction of tokens dispatched to each expert
+        tokens_per_expert = expert_mask.float().mean(dim=0)
+        # Calculate the average gate score per expert
+        gate_score_per_expert = (gate_scores.unsqueeze(-1) * F.one_hot(top_k_indices, self.num_experts)).sum(dim=1).mean(dim=0)
+        # Load balancing loss: CV^2 of (tokens_per_expert * gate_score_per_expert)
+        load_balancing_loss = (self.num_experts * torch.sum(tokens_per_expert * gate_score_per_expert))
+        
+        # 3. Dispatch tokens to experts and combine results
+        final_output = torch.zeros_like(x) # Shape: (batch_size * seq_len, d_model)
+        
+        # Create a flattened index to map each token to its chosen expert(s)
+        # `flat_top_k_indices` will tell us which expert to use for each of the (total_tokens * top_k) computations
         flat_top_k_indices = top_k_indices.flatten()
         
-        # Create a combined batch for processing, mapping each token to its chosen expert
-        # This is a simplified way to handle batching for demonstration.
-        # In a real system, this is where complex all-to-all communication would happen.
+        # Create a routing mask to send each token only to its selected experts
+        # `routing_mask` will have shape (total_tokens, num_experts, top_k) and allow us to select inputs for each expert
+        # This is a more efficient way to handle routing than a for-loop over experts
+        flat_x = x.repeat_interleave(self.top_k, dim=0) # Repeat each token k times
         
-        # Create a sparse binary mask to select tokens for each expert
-        # This mask helps us select which tokens go to which expert.
-        # It's a boolean tensor of shape (batch_size * seq_len, num_experts)
-        expert_mask = F.one_hot(top_k_indices, num_classes=self.num_experts).sum(dim=1)
-        expert_mask = expert_mask.bool()
-
-        # Initialize an empty tensor for the outputs of all experts
-        expert_outputs = torch.zeros_like(x_reshaped)
-
-        # Loop through each expert and process the assigned tokens
-        for i in range(self.num_experts):
-            # Find which tokens are assigned to this expert
-            idx, = torch.where(expert_mask[:, i])
-            
-            if idx.numel() > 0:
-                # Select the tokens for the current expert
-                expert_input = x_reshaped[idx]
-                # Process through the expert
-                expert_output = self.experts[i](expert_input)
-                # Store the output
-                expert_outputs.index_add_(0, idx, expert_output)
-
-        # 4. Weight the expert outputs by the routing weights
-        # We need to expand routing_weights and top_k_indices to gather correctly
-        expanded_routing_weights = routing_weights.flatten()
+        # The output of each expert for its assigned tokens
+        expert_outputs = torch.empty_like(flat_x)
         
-        # Scatter the weighted outputs back into the final output tensor
-        # This is a more complex gather/scatter operation in practice
-        # For simplicity, we'll iterate
-        for i in range(x_reshaped.size(0)): # Iterate over each token
-            for j in range(self.top_k):
-                expert_idx = top_k_indices[i, j]
-                weight = routing_weights[i, j]
-                
-                # In our simplified batched approach, expert_outputs contains the sum of outputs
-                # This part is tricky to implement efficiently without custom kernels.
-                # Here's a conceptual, though inefficient, way:
-                # final_output[i] += weight * self.experts[expert_idx](x_reshaped[i])
-        
-        # A more efficient, but complex, way to perform the weighted sum:
-        # We can create a dense tensor of expert outputs and then multiply by weights.
-        # This is memory-intensive but vectorized.
-        # Let's stick to a clearer, if less optimal, approach for this example.
-        
-        # Let's refine the logic to be more PyTorch-idiomatic
-        final_output = torch.zeros_like(x_reshaped)
-        # Create a flat index for batch items
-        flat_indices = torch.arange(x_reshaped.size(0)).repeat_interleave(self.top_k)
-        
-        # Gather the expert outputs corresponding to the chosen experts for each token
-        # This is complex. A simpler loop is clearer for demonstration.
-        temp_outputs = torch.zeros_like(x_reshaped)
-        for i in range(x_reshaped.size(0)):
-            for j in range(self.top_k):
-                expert_idx = top_k_indices[i, j]
-                weight = routing_weights[i, j]
-                temp_outputs[i] += self.experts[expert_idx](x_reshaped[i]) * weight
+        # Process tokens batch-wise for each expert
+        for i, expert in enumerate(self.experts):
+            # Find which tokens are routed to this expert
+            idx = (flat_top_k_indices == i)
+            if idx.any():
+                # Compute the expert's output for its assigned tokens
+                expert_outputs[idx] = expert(flat_x[idx])
 
-        final_output = temp_outputs
+        # Reshape expert_outputs and gate_scores to combine them
+        expert_outputs = expert_outputs.view(-1, self.top_k, self.d_model) # Shape: (total_tokens, top_k, d_model)
+        gate_scores = gate_scores.unsqueeze(-1) # Shape: (total_tokens, top_k, 1)
+        
+        # Weight the expert outputs by the gate scores and sum them up
+        weighted_outputs = torch.sum(expert_outputs * gate_scores, dim=1) # Shape: (total_tokens, d_model)
+        
+        # Reshape to the original input shape
+        final_output = weighted_outputs.view(batch_size, seq_len, d_model)
 
-        # Reshape back to the original input shape
-        return final_output.view(batch_size, seq_len, d_model)
-
+        return final_output, load_balancing_loss
 
 # --- Example Usage ---
 d_model = 512
@@ -363,134 +332,70 @@ top_k = 2
 batch_size = 4
 seq_len = 10
 
-# Create a dummy input tensor
+moe_layer = MoELayer(d_model, num_experts, top_k, d_hidden)
+print(f"MoE Layer: {moe_layer}")
+
+# Create dummy input
 input_tensor = torch.randn(batch_size, seq_len, d_model)
 
-# Instantiate the MoE layer
-moe_layer = MoELayer(d_model=d_model, num_experts=num_experts, top_k=top_k, d_hidden=d_hidden)
+# Forward pass
+output, aux_loss = moe_layer(input_tensor)
 
-# Get the output
-output = moe_layer(input_tensor)
-
-print("Input shape:", input_tensor.shape)
+print("\nInput shape:", input_tensor.shape)
 print("Output shape:", output.shape)
-assert input_tensor.shape == output.shape
-print("\nMoE layer executed successfully!")
+print("Auxiliary loss:", aux_loss.item())
 
 ```
 
-#### Question 6: Using Python and Matplotlib, create a visualization that explains the effect of the load balancing auxiliary loss. Show how expert utilization can be skewed without it and balanced with it.
+**2. Implement and Visualize the Effect of the `temperature` parameter in a Gating Network.**
 
-**Answer:**
+*   **Answer:** The `temperature` in a Softmax function controls the "sharpness" of the resulting probability distribution. A low temperature makes the distribution spiky (closer to a hard max), while a high temperature makes it smoother (closer to a uniform distribution). This is relevant for gating, as it controls the trade-off between confidently selecting one expert versus distributing the load more softly.
 
-This code simulates the expert selection process over several training steps. It demonstrates how a load-balancing loss term pushes the gating network to distribute its choices more evenly across all available experts.
+Here is Python code to visualize this effect.
 
 ```python
+import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --- Simulation Parameters ---
-num_experts = 16
-num_steps = 200  # Number of simulated training steps
-batch_size = 1024 # Tokens per step
-top_k = 2
-learning_rate = 0.1
-w_aux = 0.01 # Weight for the auxiliary loss
+def softmax_with_temperature(logits, temperature):
+    """Computes softmax with a temperature parameter."""
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive.")
+    return F.softmax(logits / temperature, dim=-1)
 
-# Initialize expert logits (representing the gating network's preference)
-expert_logits = np.zeros(num_experts)
+# --- Visualization ---
 
-def softmax(x):
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum()
+# Create some example logits for a gating network over 8 experts
+# Let's say one expert is clearly preferred, and others are close contenders
+gate_logits = torch.tensor([4.0, 1.5, 3.5, 1.0, 0.5, 3.8, 1.2, 0.8])
 
-def simulate_training(use_aux_loss):
-    """Simulates the evolution of expert selection over time."""
-    logits_history = []
-    expert_counts = np.zeros(num_experts)
-    current_logits = np.copy(expert_logits)
-    
-    for step in range(num_steps):
-        # Simulate gating for a batch
-        # For simplicity, we assume the gate's choice is driven by its current logits
-        gate_probs = softmax(current_logits)
-        
-        # Simulate selecting top_k experts for each token in the batch
-        # We can model this by sampling from the distribution
-        choices = np.random.choice(
-            num_experts,
-            size=(batch_size * top_k),
-            p=gate_probs
-        )
-        
-        # Count how many times each expert was chosen in this step
-        step_counts = np.bincount(choices, minlength=num_experts)
-        expert_counts += step_counts
-        
-        # --- GRADIENT UPDATE ---
-        # Simulate the gradient from the main task loss.
-        # This gradient will favor experts that are chosen (positive gradient for chosen experts).
-        # We simulate this by giving a positive reward to chosen experts.
-        grad_task = step_counts / step_counts.sum()
-        
-        # Calculate update for logits
-        update = grad_task
-        
-        if use_aux_loss:
-            # --- AUXILIARY LOSS GRADIENT ---
-            # The loss encourages counts to be equal. The gradient will push down
-            # the logits of over-used experts and push up the logits of under-used experts.
-            
-            # Simplified gradient of the load balancing loss
-            # It's proportional to the deviation from the mean count.
-            mean_count = expert_counts.mean()
-            grad_aux = expert_counts - mean_count
-            
-            # Normalize the aux gradient
-            grad_aux /= (np.std(grad_aux) + 1e-6)
+# Define a range of temperatures to test
+temperatures = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
-            # Combine gradients
-            update -= w_aux * grad_aux
+# Number of experts
+num_experts = len(gate_logits)
+expert_indices = np.arange(num_experts)
 
-        # Update the logits (simple gradient ascent)
-        current_logits += learning_rate * update
-        logits_history.append(softmax(current_logits))
-        
-    return np.array(logits_history)
+# Create plot
+plt.style.use('seaborn-v0_8-whitegrid')
+fig, ax = plt.subplots(figsize=(12, 7))
 
-# --- Run Simulations ---
-history_no_loss = simulate_training(use_aux_loss=False)
-history_with_loss = simulate_training(use_aux_loss=True)
+for temp in temperatures:
+    probabilities = softmax_with_temperature(gate_logits, temp)
+    ax.plot(expert_indices, probabilities.numpy(), marker='o', linestyle='--', label=f'Temp = {temp}')
 
-# --- Plotting ---
-fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-fig.suptitle("Effect of Load Balancing Auxiliary Loss on Expert Utilization", fontsize=16)
-
-# Plot 1: Without Auxiliary Loss
-ax1 = axes[0]
-im1 = ax1.imshow(history_no_loss.T, aspect='auto', cmap='viridis', origin='lower')
-ax1.set_title("Without Load Balancing Loss (Skewed Utilization)")
-ax1.set_ylabel("Expert ID")
-fig.colorbar(im1, ax=ax1, label="Selection Probability")
-
-# Plot 2: With Auxiliary Loss
-ax2 = axes[1]
-im2 = ax2.imshow(history_with_loss.T, aspect='auto', cmap='viridis', origin='lower')
-ax2.set_title("With Load Balancing Loss (Balanced Utilization)")
-ax2.set_xlabel("Training Step")
-ax2.set_ylabel("Expert ID")
-fig.colorbar(im2, ax=ax2, label="Selection Probability")
-
-plt.tight_layout(rect=[0, 0, 1, 0.96])
+ax.set_title('Effect of Temperature on Softmax Gating Probabilities', fontsize=16)
+ax.set_xlabel('Expert Index', fontsize=12)
+ax.set_ylabel('Probability', fontsize=12)
+ax.set_xticks(expert_indices)
+ax.set_xticklabels([f'Expert {i+1}' for i in expert_indices])
+ax.legend()
 plt.show()
 
 ```
 **Explanation of the Visualization:**
-*   **Top Plot (Without Load Balancing Loss):** You will see that over time, a few horizontal lines (representing specific experts) become bright yellow, while most others remain dark purple. This illustrates the "rich-get-richer" problem: the gating network quickly learns to favor a small subset of experts, ignoring the rest.
-*   **Bottom Plot (With Load Balancing Loss):** The colors are much more evenly distributed across all experts throughout the training steps. While there are still fluctuations, no single expert is consistently favored or starved. The auxiliary loss successfully forces the model to explore and utilize all its experts, leading to a more stable and balanced training dynamic. This is the desired behavior for an MoE model.
-
----
-## References
-- Shazeer, Noam, et al. "[Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer](https://arxiv.org/abs/1701.06538)." *arXiv preprint arXiv:1701.06538* (2017).
-- Helwan, Abdul Kader. "[Mixture of Experts-Introduction](https://abdulkaderhelwan.medium.com/mixture-of-experts-introduction-39f244a4ff05)." *Medium*, 2021.
-- Jain, Sm. "[Understanding the Mixture-of-Experts Model in Deep Learning](https://medium.com/@jain.sm/understanding-the-mixture-of-experts-model-in-deep-learning-71d2e20650ac)." *Medium*, 2021.
+*   **Low Temperature (e.g., 0.1):** The output distribution is very "peaky" or "sharp." The probability mass is highly concentrated on the expert with the highest logit (Expert 1, with logit 4.0). The model is very confident in its choice, effectively performing a hard selection (arg max).
+*   **Standard Temperature (1.0):** This is the standard Softmax. It produces a probability distribution that reflects the relative differences in the logits.
+*   **High Temperature (e.g., 10.0):** The output distribution becomes very "soft" or "smooth," approaching a uniform distribution. The differences between logits are dampened, and the model assigns almost equal probability to all experts. This encourages exploration but reduces specialization.
