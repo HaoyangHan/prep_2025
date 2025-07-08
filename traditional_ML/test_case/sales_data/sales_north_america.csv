@@ -1,0 +1,4 @@
+sale_id,product_id,customer_id,Total Sale
+101,A54,C1,$150.50
+102,B12,C2,$75.00
+103,A54,C3,$140.25
